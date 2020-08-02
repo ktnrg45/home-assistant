@@ -1,7 +1,7 @@
 """Support for Onkyo Receivers."""
 import logging
-from typing import List
 
+import defusedxml.ElementTree as ET
 import eiscp
 from eiscp import eISCP
 import voluptuous as vol
@@ -26,16 +26,20 @@ from homeassistant.const import (
     STATE_ON,
 )
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
+
+from .const import (
+    CONF_MAX_VOLUME,
+    CONF_RECEIVER_MAX_VOLUME,
+    CONF_SOURCES,
+    DEFAULT_NAME,
+    DEFAULT_RECEIVER_MAX_VOLUME,
+    DEFAULT_SOURCES,
+    ONKYO_DATA,
+    SUPPORTED_MAX_VOLUME,
+)
 
 _LOGGER = logging.getLogger(__name__)
-
-CONF_SOURCES = "sources"
-CONF_MAX_VOLUME = "max_volume"
-CONF_RECEIVER_MAX_VOLUME = "receiver_max_volume"
-
-DEFAULT_NAME = "Onkyo Receiver"
-SUPPORTED_MAX_VOLUME = 100
-DEFAULT_RECEIVER_MAX_VOLUME = 80
 
 SUPPORT_ONKYO = (
     SUPPORT_VOLUME_SET
@@ -55,22 +59,6 @@ SUPPORT_ONKYO_WO_VOLUME = (
     | SUPPORT_PLAY
     | SUPPORT_PLAY_MEDIA
 )
-
-KNOWN_HOSTS: List[str] = []
-DEFAULT_SOURCES = {
-    "tv": "TV",
-    "bd": "Bluray",
-    "game": "Game",
-    "aux1": "Aux1",
-    "video1": "Video 1",
-    "video2": "Video 2",
-    "video3": "Video 3",
-    "video4": "Video 4",
-    "video5": "Video 5",
-    "video6": "Video 6",
-    "video7": "Video 7",
-    "fm": "Radio",
-}
 
 DEFAULT_PLAYABLE_SOURCES = ("fm", "am", "tuner")
 
@@ -115,6 +103,49 @@ ONKYO_SELECT_OUTPUT_SCHEMA = vol.Schema(
 SERVICE_SELECT_HDMI_OUTPUT = "onkyo_select_hdmi_output"
 
 
+def get_receiver_info(ip_address):
+    """Return dict of extended device values."""
+    reformat = ["AUX", "VIDEO"]
+    source_mapping = {}
+    info = {}
+    receiver_info = {}
+
+    receiver = eISCP(ip_address)
+    if receiver.info is None:
+        # Return if there is no basic info.
+        return receiver_info
+    data = receiver.command("dock.receiver-information=query")[1]
+    data = ET.fromstring(data)
+    info = list(data)[0]
+    brand = info.find("brand")
+    firmwareversion = info.find("firmwareversion")
+    selectors = info.find("selectorlist")
+
+    if firmwareversion is not None:
+        firmwareversion = firmwareversion.text
+    if brand is not None:
+        brand = brand.text.title()
+    if selectors is not None:
+        for source in selectors.iter():
+            source_name = source.attrib.get("name")
+            if source.tag != "selector" or source_name == "Source":
+                continue
+            source_alias = source_name.replace(" ", "-").split("/")[0]
+            if source_alias in reformat:
+                source_alias = f"{source_alias}1"
+            source_mapping[source_alias] = source_name
+
+    receiver_info = {
+        "firmwareversion": firmwareversion,
+        "identifier": receiver.identifier,
+        "manufacturer": brand or DOMAIN.title(),
+        "model": receiver.model_name,
+        "name": receiver.model_name,
+        "sources": source_mapping or DEFAULT_SOURCES,
+    }
+    return receiver_info
+
+
 def determine_zones(receiver):
     """Determine what zones are available for the receiver."""
     out = {"zone2": False, "zone3": False}
@@ -138,6 +169,37 @@ def determine_zones(receiver):
     return out
 
 
+async def async_setup_entry(hass, config_entry, async_add_entities):
+    """Set up Onkyo from a config entry."""
+    info = await hass.async_add_executor_job(
+        get_receiver_info, config_entry.data[CONF_HOST]
+    )
+    device_registry = await hass.helpers.device_registry.async_get_registry()
+    device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(CONNECTION_NETWORK_MAC, info["identifier"])},
+        manufacturer=info["manufacturer"],
+        model=info["model"],
+        name=info["name"],
+        sw_version=info["firmwareversion"],
+    )
+    config = config_entry.data
+    await hass.async_add_executor_job(setup_platform, hass, config, async_add_entities)
+    hass.data[ONKYO_DATA][config_entry.entry_id] = config_entry.add_update_listener(
+        update_listener
+    )
+    return True
+
+
+async def update_listener(hass, config_entry):
+    """Handle Onkyo options update."""
+    _LOGGER.debug("Onkyo options updated")
+    devices = hass.data[ONKYO_DATA].get(config_entry.data[CONF_HOST])
+    if devices is not None:
+        for device in devices:
+            await device.async_options_update(config_entry.options)
+
+
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Onkyo platform."""
     host = config.get(CONF_HOST)
@@ -159,7 +221,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         schema=ONKYO_SELECT_OUTPUT_SCHEMA,
     )
 
-    if CONF_HOST in config and host not in KNOWN_HOSTS:
+    if CONF_HOST in config and host not in hass.data[ONKYO_DATA]:
         try:
             receiver = eiscp.eISCP(host)
             hosts.append(
@@ -171,7 +233,6 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
                     receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
                 )
             )
-            KNOWN_HOSTS.append(host)
 
             zones = determine_zones(receiver)
 
@@ -201,13 +262,14 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
                         receiver_max_volume=config.get(CONF_RECEIVER_MAX_VOLUME),
                     )
                 )
+            hass.data[ONKYO_DATA][host] = hosts
         except OSError:
             _LOGGER.error("Unable to connect to receiver at %s", host)
     else:
         for receiver in eISCP.discover():
-            if receiver.host not in KNOWN_HOSTS:
+            if receiver.host not in hass.data[ONKYO_DATA]:
                 hosts.append(OnkyoDevice(receiver, config.get(CONF_SOURCES)))
-                KNOWN_HOSTS.append(receiver.host)
+                hass.data[ONKYO_DATA][receiver.host] = hosts
     add_entities(hosts, True)
 
 
@@ -227,16 +289,30 @@ class OnkyoDevice(MediaPlayerEntity):
         self._muted = False
         self._volume = 0
         self._pwstate = STATE_OFF
-        self._name = (
-            name or f"{receiver.info['model_name']}_{receiver.info['identifier']}"
-        )
-        self._max_volume = max_volume
-        self._receiver_max_volume = receiver_max_volume
+        self._name = name or DEFAULT_NAME
+        self._max_volume = max_volume or SUPPORTED_MAX_VOLUME
+        self._receiver_max_volume = receiver_max_volume or DEFAULT_RECEIVER_MAX_VOLUME
         self._current_source = None
         self._source_list = list(sources.values())
         self._source_mapping = sources
         self._reverse_mapping = {value: key for key, value in sources.items()}
         self._attributes = {}
+        self._unique_id = f"{receiver.info['model_name']}_{receiver.info['identifier']}"
+
+    async def async_will_remove_from_hass(self):
+        """Remove Entity from Home Assistant."""
+        if self._receiver.host in self.hass.data[ONKYO_DATA]:
+            self.hass.data[ONKYO_DATA].pop(self._receiver.host)
+
+    async def async_options_update(self, options):
+        """Handle options updated."""
+        self._max_volume = options[CONF_MAX_VOLUME]
+        self._receiver_max_volume = options[CONF_RECEIVER_MAX_VOLUME]
+        _LOGGER.debug(
+            "Max Volume=%s Receiver Max Volume=%s",
+            self._max_volume,
+            self._receiver_max_volume,
+        )
 
     def command(self, command):
         """Run an eiscp command and catch connection errors."""
@@ -337,6 +413,11 @@ class OnkyoDevice(MediaPlayerEntity):
         """Return device specific state attributes."""
         return self._attributes
 
+    @property
+    def unique_id(self):
+        """Return Unique ID for entity."""
+        return self._unique_id
+
     def turn_off(self):
         """Turn the media player off."""
         self.command("system-power standby")
@@ -407,6 +488,7 @@ class OnkyoDeviceZone(OnkyoDevice):
         self._zone = zone
         self._supports_volume = True
         super().__init__(receiver, sources, name, max_volume, receiver_max_volume)
+        self._unique_id = f"{self._unique_id}_zone_{self._zone}"
 
     def update(self):
         """Get the latest state from the device."""

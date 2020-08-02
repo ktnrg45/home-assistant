@@ -1,0 +1,29 @@
+{
+    "config": {
+        "abort": {
+            "no_devices_found": "Device not found",
+            "single_instance_allowed": "Device already configured"
+        },
+        "step": {
+            "user": {
+                "data": {
+                    "host": "IP Address"
+                },
+                "description": "Configuration"
+            }
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "data": {
+                    "max_volume": "Maximum volume percentage allowed for Home Assistant",
+                    "receiver_max_volume": "Maximum volume level of receiver"
+                },
+                "description": "Set Volume Options",
+                "title": "Onkyo Options"
+            }
+        }
+    },
+    "title": "Onkyo"
+}

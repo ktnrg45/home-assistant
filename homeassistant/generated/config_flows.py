@@ -118,6 +118,7 @@ FLOWS = [
     "nuheat",
     "nut",
     "nws",
+    "onkyo",
     "onvif",
     "opentherm_gw",
     "openuv",
